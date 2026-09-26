@@ -1,0 +1,134 @@
+name: Marsad Android 2.1.14 Build and Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "MarsadAndroid214.zip"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Extract Marsad Android project
+        run: |
+          rm -rf android-src
+          mkdir android-src
+          unzip -q MarsadAndroid214.zip -d android-src
+
+          SETTINGS=$(find android-src -maxdepth 5 \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "Android project settings.gradle not found"
+            find android-src -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project found at: $PROJECT_DIR"
+
+      - name: Build APK
+        run: |
+          cd "$PROJECT_DIR"
+
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon clean :app:assembleDebug --stacktrace
+          else
+            gradle clean :app:assembleDebug --stacktrace
+          fi
+
+          APK=$(find app/build/outputs/apk -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "APK was not generated"
+            exit 1
+          fi
+
+          cp "$APK" "$GITHUB_WORKSPACE/Marsad-2.1.14-Android.apk"
+          sha256sum "$GITHUB_WORKSPACE/Marsad-2.1.14-Android.apk" | tee "$GITHUB_WORKSPACE/apk-sha256.txt"
+
+      - name: Test Marsad on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          script: |
+            set -e
+
+            adb install -r Marsad-2.1.14-Android.apk
+
+            adb logcat -c
+
+            adb shell monkey \
+              -p iq.bashar.marsad \
+              -c android.intent.category.LAUNCHER \
+              1
+
+            sleep 15
+
+            PID=$(adb shell pidof iq.bashar.marsad | tr -d '\r')
+
+            echo "Marsad PID: $PID" | tee pid.txt
+
+            adb exec-out screencap -p > marsad-screen.png
+            adb logcat -d > logcat.txt
+
+            if [ -z "$PID" ]; then
+              echo "Marsad closed after launch"
+              tail -n 300 logcat.txt
+              exit 1
+            fi
+
+            if grep -E "FATAL EXCEPTION|Process: iq\.bashar\.marsad.*FATAL" logcat.txt; then
+              echo "Marsad crashed"
+              exit 1
+            fi
+
+            echo "Marsad launched successfully and remained running."
+
+      - name: Upload APK and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Marsad-2.1.14-Android-Tested
+          path: |
+            Marsad-2.1.14-Android.apk
+            apk-sha256.txt
+            pid.txt
+            logcat.txt
+            marsad-screen.png
+          if-no-files-found: warn
+          retention-days: 14
